@@ -1,13 +1,15 @@
 # Cyberbullying Detection — Project 4 (RL)
 
 ## Project summary
-This repository extends the Project 3 *fast group-level cyberbullying detection* pipeline with a **reinforcement learning (RL) decision layer**.
+This repository extends the Project 3 *fast group-level cyberbullying detection* pipeline with a **reinforcement learning (RL) decision layer** for alerting.
 
-The core idea is to move beyond expensive per-message classification or LLM-based moderation by:
-- Producing **fast, set-level risk signals** over a rolling context (mean risk + concentration/burstiness).
-- Training an RL agent to decide **when to raise an alert** based on these signals (balancing false positives vs missed escalations).
+The goal is to make **real-time alert decisions** on large, high-volume message streams using *cheap, streaming features* rather than expensive per-message LLM moderation.
 
-This repo is **not** a full end-to-end training pipeline. It is a focused notebook showing **stream simulation + inference features + RL policy learning**.
+In this notebook the system:
+- Simulates a live stream (`civil_comments`) and injects synthetic “raids” (bursty harassment).
+- Runs a pretrained **dual-head Set Transformer** over a rolling context window to produce two set-level risk signals.
+- Converts those signals into a low-dimensional RL state.
+- Trains a PPO policy to choose **when to alert** (`0/1`) under a simple reward that trades off false positives vs missed toxic events.
 
 ## Background / problem statement
 Social platforms often need to detect **group-level / crowded cyberbullying**: “pile-ons”, raids, or coordinated harassment where many semantically similar harmful messages arrive in a short span.
@@ -44,7 +46,7 @@ So, to run Project 4 end-to-end you typically need to first run the Project 3 no
 ## Datasets
 
 ### Inference simulation dataset
-- Hugging Face Datasets: `civil_comments`
+- Hugging Face Datasets: `civil_comments` (https://huggingface.co/datasets/civil_comments)
 
 Used for:
 - `text`: message content.
@@ -95,11 +97,25 @@ The notebook defines a Gymnasium environment `AlertEnv` with:
   - `0` = no alert
   - `1` = alert
 
+**Episode definition (as implemented)**
+- One episode is a full pass over the constructed stream dataframe (`out_df`).
+- Episode length is therefore approximately `len(out_df)` (in the notebook run: `ep_len_mean ≈ 5.04e+03`).
+- At each step `t`, the agent observes the 4D state derived from the monitoring loop and chooses whether to alert.
+
 ### Reward (as implemented)
 Reward is shaped using the *proxy* toxicity:
 - Alert on high-toxicity messages (`toxicity > 0.7`): positive reward
 - Alert on low-toxicity messages: negative reward
 - Do nothing on high-toxicity messages: small penalty
+
+Concretely:
+
+| Agent action | Condition (proxy) | Reward |
+|---:|---|---:|
+| alert (`1`) | `toxicity > 0.7` | `+1.0` |
+| alert (`1`) | `toxicity <= 0.7` | `-0.5` |
+| no alert (`0`) | `toxicity > 0.7` | `-0.2` |
+| no alert (`0`) | `toxicity <= 0.7` | `0.0` |
 
 ### Algorithm
 - Stable-Baselines3 `PPO` with an `MlpPolicy`
@@ -108,6 +124,40 @@ Reward is shaped using the *proxy* toxicity:
   - `n_steps=256`
   - `batch_size=64`
   - `total_timesteps=10_000`
+
+### Sample from the learning loop (PPO rollouts)
+Stable-Baselines3 reports episode statistics during training. In the notebook run:
+
+| PPO iteration | total_timesteps | ep_len_mean | ep_rew_mean |
+|---:|---:|---:|---:|
+| 20 | 5120 | ~5040 | -216 |
+| 40 | 10240 | ~5040 | -118 |
+
+This shows that the agent’s average episodic reward (under the shaped proxy reward) improved during training.
+
+---
+
+## Evaluation: RL policy vs naive threshold baseline
+The notebook compares PPO against a simple threshold baseline:
+
+- **Naive baseline**: alert if `rolling_mean > 0.6` OR `rolling_conc > 0.5`.
+- **RL policy**: action from `model.predict(obs, deterministic=True)` on the same 4D observation.
+
+Both are scored with the same `evaluate_policy(...)` reward function (the shaped proxy reward described above).
+
+**Final reward comparison (as printed in the notebook)**
+
+| Policy | Total reward |
+|---|---:|
+| Naive threshold | `-19.8` |
+| PPO (RL) | `-19.8` |
+
+**Conclusion**
+In this specific run, the trained PPO policy did **not** outperform the naive threshold baseline on the final evaluation metric (both achieve the same total reward).
+
+This is still a useful result because it highlights a key modeling point for this setup:
+- With a **single deterministic stream** and a **per-step proxy reward**, PPO can learn (rollout reward improves) yet still fail to beat a hand-tuned rule on the final aggregate score.
+- Improving over the baseline likely requires changes such as: multiple randomized episodes (different raid locations / seeds), better reward shaping (sequence-level costs for alert fatigue), richer action space (warn/timeout/escalate), and/or explicit evaluation splits.
 
 ---
 
